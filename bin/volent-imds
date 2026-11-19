@@ -1,0 +1,60 @@
+#!/bin/bash
+# volent-imds <state-dir> -- one guest connection to 169.254.169.254:80.
+#
+# QEMU's guestfwd runs this once per TCP connection the node opens to the
+# metadata address, with the connection on stdin/stdout. It speaks just enough
+# EC2 IMDSv2 for the node to read its provisioning document at boot:
+#
+#   PUT /latest/api/token                 -> a session token
+#   GET /latest/user-data (with token)    -> the provisioning document
+#
+# Anything else is 404, and user-data without the token is 401. The node seals
+# the metadata address after its boot window, so this answers only at boot.
+# Nothing listens on the host: no other local user can ask it anything.
+
+set -u
+export LC_ALL=C
+
+state=${1:?state dir}
+session=$(<"$state/imds-session")
+
+reply() { # reply <code> <reason> <body>
+  printf 'HTTP/1.1 %s %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s' \
+    "$1" "$2" "${#3}" "$3"
+}
+
+while IFS= read -r -t 30 line; do
+  line=${line%$'\r'}
+  [[ -n $line ]] || continue
+  method=${line%% *}
+  path=${line#* }
+  path=${path%% *}
+
+  length=0
+  token=""
+  while IFS= read -r -t 30 header; do
+    header=${header%$'\r'}
+    [[ -n $header ]] || break
+    name=${header%%:*}
+    value=${header#*:}
+    value=${value# }
+    case ${name,,} in
+      content-length) [[ $value =~ ^[0-9]+$ ]] && length=$value ;;
+      x-aws-ec2-metadata-token) token=$value ;;
+    esac
+  done
+  ((length > 0 && length < 65536)) && IFS= read -r -N "$length" -t 30 _
+
+  case "$method $path" in
+    "PUT /latest/api/token")
+      reply 200 OK "$session" ;;
+    "GET /latest/user-data")
+      if [[ $token == "$session" ]]; then
+        reply 200 OK "$(<"$state/user-data")"$'\n'
+      else
+        reply 401 Unauthorized "an IMDSv2 token is required"
+      fi ;;
+    *)
+      reply 404 "Not Found" "no such metadata path" ;;
+  esac
+done

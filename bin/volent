@@ -1,0 +1,417 @@
+#!/bin/bash
+# volent -- run a local VOLENT node on this machine, as you, under QEMU/KVM.
+#
+#   volent up [--image PATH|DIR]   verify the signed image, boot it, wait for health
+#   volent status [--short]        is it running, where, and what does it say
+#   volent logs [-f] [-n N]        the node's serial console
+#   volent down                    stop it and throw its scratch disk away
+#   volent verify [--image PATH]   verify only; boot nothing
+#   volent request                 ask VOLENT for the image
+#
+# No sudo, no system changes. Everything this writes lives under
+# ~/.local/state/volent; images are read from ~/.local/share/volent/images.
+
+set -euo pipefail
+
+# The image signing key, ed25519 SubjectPublicKeyInfo in base64. A LITERAL,
+# copied from the engine's dist/install.sh: a verifier that downloads its own
+# key verifies nothing.
+VOLENT_PUBKEY_SPKI_B64='MCowBQYDK2VwAyEA6q2sxOHtS3Bz3PLCVn33qKHiIWJ3D72Xv4P8WZen8r4='
+
+IMAGES_DIR="${VOLENT_IMAGES_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/volent/images}"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/volent/node"
+SIGNUP_URL="https://app.volent.dev/signup"
+CONTACT_URL="https://volent.dev/pricing/#contact"
+GUEST_API_PORT=8080           # where the node's control API listens inside the guest
+PORT_BASE="${VOLENT_PORT:-47800}"
+MEM_MB="${VOLENT_MEM_MB:-2048}"
+CPUS="${VOLENT_CPUS:-2}"
+HEALTH_TIMEOUT="${VOLENT_TIMEOUT:-180}"
+
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+
+say() { printf 'volent: %s\n' "$*"; }
+die() { printf 'volent: %s\n' "$*" >&2; exit 1; }
+refuse() {
+  printf '\nvolent: REFUSED -- %s\n' "$1" >&2
+  shift
+  local line
+  for line in "$@"; do printf '  %s\n' "$line" >&2; done
+  printf '  Nothing was booted.\n\n' >&2
+  exit 1
+}
+
+graphical() { [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} && -z ${VOLENT_NO_BROWSER:-} ]]; }
+
+open_url() {
+  if graphical && command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$1" >/dev/null 2>&1 &
+    say "opened $1 in your browser"
+  else
+    say "open this in a browser: $1"
+  fi
+}
+
+notify() {
+  graphical && command -v notify-send >/dev/null 2>&1 && notify-send -a VOLENT "VOLENT" "$1" 2>/dev/null || true
+}
+
+WORK=""
+cleanup_work() { [[ -n $WORK ]] && rm -rf -- "$WORK"; return 0; }
+trap cleanup_work EXIT
+
+# --- the running node --------------------------------------------------------
+
+# The PID is only believed if that process is QEMU running OUR overlay. A stale
+# pidfile must never lead to signalling somebody else's process.
+node_pid() {
+  local pid
+  [[ -s $STATE/qemu.pid ]] || return 1
+  pid=$(<"$STATE/qemu.pid")
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  [[ -r /proc/$pid/cmdline ]] || return 1
+  tr '\0' '\n' <"/proc/$pid/cmdline" | grep -qxF -- "if=none,id=disk0,format=qcow2,file=$STATE/disk.qcow2" || return 1
+  printf '%s\n' "$pid"
+}
+
+health() { # health <port> <outfile> -> prints the HTTP status code
+  curl -sS -o "$2" -w '%{http_code}' --max-time 5 \
+    -H @"$STATE/auth-header" "http://127.0.0.1:$1/v1/system/health" 2>/dev/null || true
+}
+
+# --- finding and verifying an image -------------------------------------------
+
+find_manifest() { # find_manifest <file-or-dir> -> path of the one *.manifest
+  local where=$1 found=()
+  if [[ -f $where ]]; then
+    [[ $where == *.manifest ]] && { printf '%s\n' "$where"; return 0; }
+    where=$(dirname -- "$where")
+  fi
+  [[ -d $where ]] || return 1
+  mapfile -t found < <(find "$where" -maxdepth 2 -type f -name '*.manifest' | sort)
+  case ${#found[@]} in
+    0) return 1 ;;
+    1) printf '%s\n' "${found[0]}" ;;
+    *) die "more than one image under $where; pick one with --image:$(printf '\n  %s' "${found[@]}")" ;;
+  esac
+}
+
+no_image() {
+  cat <<EOF
+
+VOLENT's image is not publicly downloadable. It is shared after a short
+sign-up at:
+
+  $SIGNUP_URL
+
+When you have it, put the image files (volent-*.qcow2 or volent-*.raw, plus
+the .manifest and .manifest.sig next to it) in
+
+  $IMAGES_DIR/
+
+and run: volent up
+
+Rather talk to someone first? Run: volent request
+
+EOF
+  open_url "$SIGNUP_URL"
+  exit 1
+}
+
+# Sets IMG_* globals. Refuses on anything that does not check out.
+verify_image() {
+  local man=$1 sig="$1.sig" dir raw_name qcow_name want got bytes
+  dir=$(dirname -- "$man")
+  [[ -s $sig ]] || refuse "there is no signature for $man" "expected $sig next to it."
+
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/volent.XXXXXX")
+  # Verify a private copy, then parse that same copy: the bytes checked are
+  # the bytes believed.
+  cp -- "$man" "$WORK/manifest"
+  printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' \
+    "$VOLENT_PUBKEY_SPKI_B64" >"$WORK/key.pem"
+  base64 -d <"$sig" >"$WORK/sig.bin" 2>/dev/null \
+    || refuse "the signature $sig is not base64."
+  openssl pkeyutl -verify -pubin -inkey "$WORK/key.pem" -rawin \
+      -in "$WORK/manifest" -sigfile "$WORK/sig.bin" >/dev/null 2>&1 \
+    || refuse "THE MANIFEST SIGNATURE DOES NOT VERIFY." \
+              "$man was not signed by VOLENT's image key, or it has been changed."
+  say "manifest signature verifies against the pinned VOLENT key"
+
+  # Parsed only after the signature check.
+  field() { sed -n "s/^$1=//p" "$WORK/manifest" | head -1; }
+  [[ $(head -1 "$WORK/manifest") == "VOLENT-IMAGE/1" ]] || refuse "unrecognised manifest format in $man."
+  IMG_PRODUCT=$(field product); IMG_VERSION=$(field version)
+  IMG_CHANNEL=$(field channel); IMG_PROV=$(field sb_key_provenance)
+  raw_name=$(field raw_name)
+  [[ $raw_name =~ ^[A-Za-z0-9._-]+\.raw$ ]] || refuse "the signed manifest names no usable raw image."
+  qcow_name="${raw_name%.raw}.qcow2"
+
+  if [[ -f $dir/$qcow_name ]]; then
+    IMG_DISK="$dir/$qcow_name"; IMG_FMT=qcow2; want=$(field qcow2_sha256)
+  elif [[ -f $dir/$raw_name ]]; then
+    IMG_DISK="$dir/$raw_name"; IMG_FMT=raw; want=$(field raw_sha256)
+    bytes=$(stat -c%s -- "$IMG_DISK")
+    [[ $bytes == "$(field raw_bytes)" ]] \
+      || refuse "$IMG_DISK is $bytes bytes; the signed manifest says $(field raw_bytes)."
+  else
+    refuse "the manifest is here but the disk is not." "looked for $dir/$qcow_name and $dir/$raw_name."
+  fi
+  [[ $want =~ ^[0-9a-f]{64}$ ]] || refuse "the signed manifest carries no sha256 for $IMG_FMT."
+
+  say "checking $(basename -- "$IMG_DISK") against the signed manifest..."
+  got=$(sha256sum -- "$IMG_DISK" | cut -d' ' -f1)
+  [[ $got == "$want" ]] \
+    || refuse "THE DISK DOES NOT MATCH THE SIGNED MANIFEST." \
+              "$IMG_DISK" "hashes to  $got" "manifest:  $want"
+  IMG_SHA=$got
+  IMG_DISK=$(readlink -f -- "$IMG_DISK")
+  say "image:   $IMG_PRODUCT $IMG_VERSION ($IMG_FMT, sha256 ${IMG_SHA:0:12}) -- verified"
+}
+
+dev_keys_notice() {
+  [[ $IMG_CHANNEL == release && $IMG_PROV != dev-only* ]] && return 0
+  cat <<EOF
+
+  NOTE: this image (channel=$IMG_CHANNEL, sb_key_provenance=$IMG_PROV) is signed
+  with DEVELOPMENT Secure Boot keys. Those keys are disclosed and protect nothing,
+  so treat this node as a local preview, not a production trust anchor.
+  (volent up boots it with plain UEFI firmware, without Secure Boot.)
+
+EOF
+}
+
+MAN=""
+resolve_image() { # resolve_image <arg-or-empty> -> sets MAN, or runs the sign-up flow
+  local arg=$1
+  if [[ -n $arg ]]; then
+    [[ -e $arg ]] || die "no such file or directory: $arg"
+    MAN=$(find_manifest "$arg") || refuse "no VOLENT image manifest (*.manifest) found at $arg."
+  else
+    MAN=$(find_manifest "$IMAGES_DIR") || no_image
+  fi
+}
+
+# --- host checks ---------------------------------------------------------------
+
+OVMF_CODE=""; OVMF_VARS=""
+check_host() {
+  local t missing=()
+  for t in qemu-system-x86_64 qemu-img openssl sha256sum curl base64; do
+    command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+  done
+  ((${#missing[@]} == 0)) || die "missing: ${missing[*]}. On Omarchy: sudo pacman -S --needed qemu-base edk2-ovmf"
+  [[ -r /dev/kvm && -w /dev/kvm ]] \
+    || die "/dev/kvm is not usable by $(id -un). VOLENT needs hardware virtualization (KVM): enable VT-x/AMD-V in firmware, and check the kvm group."
+  for t in /usr/share/edk2/x64 /usr/share/edk2-ovmf/x64 /usr/share/OVMF; do
+    if [[ -f $t/OVMF_CODE.4m.fd && -f $t/OVMF_VARS.4m.fd ]]; then
+      OVMF_CODE=$t/OVMF_CODE.4m.fd; OVMF_VARS=$t/OVMF_VARS.4m.fd; break
+    fi
+  done
+  [[ -n $OVMF_CODE ]] || die "no UEFI firmware found. On Omarchy: sudo pacman -S --needed edk2-ovmf"
+}
+
+port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+pick_port() {
+  local p
+  for ((p = PORT_BASE; p < PORT_BASE + 100; p++)); do
+    port_free "$p" && { printf '%s\n' "$p"; return 0; }
+  done
+  die "no free port in 127.0.0.1:$PORT_BASE-$((PORT_BASE + 99)); set VOLENT_PORT"
+}
+
+# --- commands ------------------------------------------------------------------
+
+cmd_up() {
+  local image_arg="" port pid t0 code i
+  while (($#)); do
+    case $1 in
+      --image) image_arg=${2:-}; [[ -n $image_arg ]] || die "--image needs a path"; shift 2 ;;
+      *) die "up: unknown option $1" ;;
+    esac
+  done
+
+  if pid=$(node_pid); then
+    say "already running (pid $pid) -- see: volent status"
+    return 0
+  fi
+
+  resolve_image "$image_arg"
+  check_host
+  verify_image "$MAN"
+  dev_keys_notice
+
+  # QEMU splits -netdev on ',' and runs the guestfwd command split on spaces.
+  [[ $STATE$SELF_DIR != *[,[:space:]]* ]] || die "paths with ',' or spaces are not supported here: $STATE / $SELF_DIR"
+
+  # Fresh, private, throwaway state for this node.
+  rm -rf -- "$STATE"
+  mkdir -p -- "$STATE"
+  chmod 700 -- "$STATE"
+
+  # The original image is never written: the node runs on a qcow2 overlay.
+  qemu-img create -q -f qcow2 -F "$IMG_FMT" -b "$IMG_DISK" "$STATE/disk.qcow2"
+  cp -- "$OVMF_VARS" "$STATE/vars.fd"
+
+  # A fresh API credential per boot. The node learns it the way it would in a
+  # cloud: as user-data from the metadata service (IMDSv2), which here is a
+  # tiny per-connection handler QEMU runs for 169.254.169.254:80. No host
+  # port is opened for it.
+  (
+    umask 077
+    printf 'api_token: %s\napi_bind: 0.0.0.0\n' "$(openssl rand -hex 32)" >"$STATE/user-data"
+    printf 'Authorization: Bearer %s\n' "$(sed -n 's/^api_token: //p' "$STATE/user-data")" >"$STATE/auth-header"
+    openssl rand -hex 24 >"$STATE/imds-session"
+  )
+
+  port=$(pick_port)
+  printf '%s\n' "$port" >"$STATE/port"
+  printf '%s\n' "$IMG_DISK" >"$STATE/image"
+  : >"$STATE/serial.log"
+
+  say "booting on KVM ($CPUS vCPU, ${MEM_MB} MiB); control API -> 127.0.0.1:$port"
+  t0=$(date +%s)
+  qemu-system-x86_64 \
+    -name volent \
+    -machine q35,accel=kvm -cpu host -smp "$CPUS" -m "$MEM_MB" \
+    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+    -drive "if=pflash,format=raw,file=$STATE/vars.fd" \
+    -drive "if=none,id=disk0,format=qcow2,file=$STATE/disk.qcow2" \
+    -device virtio-blk-pci,drive=disk0 \
+    -netdev "user,id=n0,net=169.254.169.0/24,guestfwd=tcp:169.254.169.254:80-cmd:$SELF_DIR/volent-imds $STATE,hostfwd=tcp:127.0.0.1:$port-:$GUEST_API_PORT" \
+    -device virtio-net-pci,netdev=n0 \
+    -display none -monitor none \
+    -serial "file:$STATE/serial.log" \
+    -pidfile "$STATE/qemu.pid" -daemonize \
+    || die "QEMU did not start (see the message above)."
+
+  pid=$(node_pid) || die "QEMU started but is not running; see: volent logs"
+  say "QEMU pid $pid; waiting for the node to report healthy (up to ${HEALTH_TIMEOUT}s)..."
+
+  for ((i = 0; i < HEALTH_TIMEOUT; i++)); do
+    node_pid >/dev/null || { tail -n 20 "$STATE/serial.log" >&2; die "the node stopped while booting (serial log above)."; }
+    code=$(health "$port" "$STATE/health.json")
+    [[ $code == 200 ]] && break
+    sleep 1
+  done
+  [[ $code == 200 ]] || die "no healthy answer after ${HEALTH_TIMEOUT}s (last HTTP status: ${code:-none}). It is still running: volent logs / volent down"
+
+  cat <<EOF
+
+VOLENT is up -- healthy after $(( $(date +%s) - t0 ))s.
+
+  control API   http://127.0.0.1:$port   (loopback only)
+  credential    $STATE/auth-header
+  try           curl -H @$STATE/auth-header http://127.0.0.1:$port/v1/system/health
+  console log   volent logs
+  stop          volent down
+
+EOF
+  notify "Node is up on 127.0.0.1:$port"
+}
+
+cmd_status() {
+  local short=0 pid port code
+  [[ ${1:-} == --short ]] && short=1
+  if ! pid=$(node_pid); then
+    if ((short)); then echo down; else say "not running"; fi
+    return 3
+  fi
+  port=$(<"$STATE/port")
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/volent.XXXXXX")
+  code=$(health "$port" "$WORK/h.json")
+  if ((short)); then
+    if [[ $code == 200 ]]; then echo "up 127.0.0.1:$port"; else echo "starting 127.0.0.1:$port"; fi
+    return 0
+  fi
+  say "running: pid $pid, control API http://127.0.0.1:$port"
+  say "image:   $(<"$STATE/image")"
+  if [[ $code == 200 ]]; then
+    say "health:  $(<"$WORK/h.json")"
+  else
+    say "health:  not answering yet (HTTP ${code:-none})"
+  fi
+}
+
+cmd_logs() {
+  local follow=0 n=50
+  while (($#)); do
+    case $1 in
+      -f) follow=1; shift ;;
+      -n) n=${2:-50}; [[ $n =~ ^[0-9]+$ ]] || die "-n needs a number"; shift 2 ;;
+      *) die "logs: unknown option $1" ;;
+    esac
+  done
+  [[ -f $STATE/serial.log ]] || die "no console log yet; start a node with: volent up"
+  # The firmware writes terminal control sequences to the console; drop them.
+  if ((follow)); then
+    tail -n "$n" -f -- "$STATE/serial.log" | sed -u 's/\x1b\[[0-9;=?]*[A-Za-z]//g'
+  else
+    tail -n "$n" -- "$STATE/serial.log" | sed 's/\x1b\[[0-9;=?]*[A-Za-z]//g'
+  fi
+}
+
+cmd_down() {
+  local pid i
+  if pid=$(node_pid); then
+    say "stopping QEMU (pid $pid)..."
+    kill -TERM "$pid"
+    for ((i = 0; i < 100; i++)); do node_pid >/dev/null || break; sleep 0.1; done
+    if node_pid >/dev/null; then
+      say "still running after 10s; forcing it"
+      kill -KILL "$pid"
+      sleep 0.5
+    fi
+  else
+    say "not running"
+  fi
+  # Throw the scratch disk and the credential away; keep the console log.
+  [[ -d $STATE ]] && find "$STATE" -mindepth 1 -maxdepth 1 ! -name serial.log -exec rm -rf -- {} +
+  say "stopped; scratch disk and credential removed (last console log kept: volent logs)"
+  notify "Node stopped"
+}
+
+cmd_verify() {
+  local image_arg=""
+  [[ ${1:-} == --image ]] && image_arg=${2:-}
+  resolve_image "$image_arg"
+  verify_image "$MAN"
+  dev_keys_notice
+  say "OK -- this image would be booted."
+}
+
+cmd_request() {
+  cat <<EOF
+
+To get the VOLENT image, ask the team on the contact form:
+
+  $CONTACT_URL
+
+(The form is a browser form on volent.dev; this command does not send
+anything on your behalf.)
+
+EOF
+  open_url "$CONTACT_URL"
+}
+
+usage() {
+  sed -n '2,10s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+}
+
+main() {
+  local cmd=${1:-help}
+  (($#)) && shift
+  case $cmd in
+    up) cmd_up "$@" ;;
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    down | stop) cmd_down "$@" ;;
+    verify) cmd_verify "$@" ;;
+    request) cmd_request "$@" ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

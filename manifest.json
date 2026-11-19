@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "volent",
+  "name": "VOLENT",
+  "version": "0.1.0",
+  "author": "Vin Patel",
+  "description": "Run a local VOLENT node (a sealed VM for AI agents) under KVM: verifies the signed image, boots it on a throwaway overlay, and shows its state in the bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "VOLENT",
+    "description": "Shows whether a local VOLENT node is running; click to start it or see its status.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
