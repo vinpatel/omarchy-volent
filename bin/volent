@@ -99,8 +99,8 @@ find_manifest() { # find_manifest <file-or-dir> -> path of the one *.manifest
 no_image() {
   cat <<EOF
 
-VOLENT's image is not publicly downloadable. It is shared after a short
-sign-up at:
+VOLENT's image is not publicly downloadable. Sign up here, and we send it
+to you after a short call:
 
   $SIGNUP_URL
 

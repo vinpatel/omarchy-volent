@@ -59,8 +59,8 @@ The plugin never uses sudo and writes only under `~/.local/state/volent`.
 
 ## Getting the image
 
-The VOLENT image is not publicly downloadable. You get it after a short
-sign-up at <https://app.volent.dev/signup>. Running `volent up` without an
+The VOLENT image is not publicly downloadable. Sign up at
+<https://app.volent.dev/signup> and we send it to you after a short call. Running `volent up` without an
 image explains this and opens that page. If you would rather talk to someone
 first, `volent request` opens the contact form at
 <https://volent.dev/pricing/#contact>.
@@ -77,8 +77,8 @@ volent-1.0.0-dev-x86_64.manifest.sig
 ## Install
 
 ```sh
-omarchy plugin add <repository-url> --enable
-ln -s ~/.config/omarchy/plugins/volent/bin/volent ~/.local/bin/volent
+omarchy plugin add https://github.com/vinpatel/omarchy-volent --enable
+ln -s ~/.config/omarchy/plugins/dev.volent.omarchy/bin/volent ~/.local/bin/volent
 ```
 
 The second line puts `volent` on your PATH. Omarchy plugins do not do this for
@@ -88,7 +88,7 @@ you, and you can skip it and run the full path instead.
 
 ```sh
 volent down
-omarchy plugin remove volent
+omarchy plugin remove dev.volent.omarchy
 rm -f ~/.local/bin/volent
 rm -rf ~/.local/state/volent    # the last console log
 ```
@@ -101,3 +101,8 @@ These environment variables are optional: `VOLENT_IMAGES_DIR`, `VOLENT_PORT`
 (first port to try), `VOLENT_MEM_MB` (default 2048), `VOLENT_CPUS` (default 2),
 `VOLENT_TIMEOUT` (seconds to wait for health, default 180), and
 `VOLENT_NO_BROWSER=1`.
+
+## Licence
+
+The plugin's own files are under the MIT licence (see `LICENSE`). The VOLENT
+image is not part of this repository and is licensed separately.
